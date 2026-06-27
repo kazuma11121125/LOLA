@@ -6,11 +6,13 @@
 // 送受信する任意の構造体を定義
 // ==========================================
 struct MySensorData {
+    static const uint8_t ID = 1;
     float temperature;
     float humidity;
 };
 
 struct MyCommand {
+    static const uint8_t ID = 2;
     int cmd_type;
     bool enable;
 };
@@ -21,25 +23,6 @@ struct MyCommand {
 CLoRa lora;
 LolaStruct lola(&lora);
 
-// ==========================================
-// 受信時のコールバック関数
-// ==========================================
-void onPacketReceived(uint8_t packet_type, uint8_t* payload, uint16_t payload_len, int rssi) {
-    SerialMon.printf("=== パケット受信 (ID: %d, RSSI: %d) ===\n", packet_type, rssi);
-
-    if (packet_type == 1 && payload_len == sizeof(MySensorData)) {
-        MySensorData* data = (MySensorData*)payload;
-        SerialMon.printf("  [Sensor] Temp: %.2f, Hum: %.2f\n", data->temperature, data->humidity);
-    } 
-    else if (packet_type == 2 && payload_len == sizeof(MyCommand)) {
-        MyCommand* data = (MyCommand*)payload;
-        SerialMon.printf("  [Command] Type: %d, Enable: %d\n", data->cmd_type, data->enable);
-    }
-}
-
-// ==========================================
-// 初期設定 (Setup)
-// ==========================================
 void setup() {
     // シリアルモニタの初期化
     SerialMon.begin(9600);
@@ -51,44 +34,45 @@ void setup() {
     if (lora.LoadConfigSetting(CONFIG_FILENAME, lora.config)) {
         SerialMon.println("Configの読み込みに失敗しました。デフォルト値を使用します。");
     }
-
-    // LoRaモジュールの初期化
     if (lora.InitLoRaModule(lora.config)) {
         SerialMon.println("LoRaモジュールの初期化に失敗しました。");
         while(1) { delay(100); }
     }
     SerialMon.println("LoRaモジュール初期化 成功");
 
-    // ノーマルモード(M0=0,M1=0)へ移行
     lora.SwitchToNormalMode();
 
-    // LolaStruct のコールバック関数を登録
-    lola.setCallback(onPacketReceived);
+    // 受信時のコールバック関数
+    lola.onPacket<MySensorData>([](const MySensorData& data, int rssi) {
+        SerialMon.printf("=== Sensor受信 (RSSI: %d) ===\n", rssi);
+        SerialMon.printf("  Temp: %.2f, Hum: %.2f\n", data.temperature, data.humidity);
+    });
+
+    lola.onPacket<MyCommand>([](const MyCommand& data, int rssi) {
+        SerialMon.printf("=== Command受信 (RSSI: %d) ===\n", rssi);
+        SerialMon.printf("  Type: %d, Enable: %d\n", data.cmd_type, data.enable);
+    });
 }
+
 void loop() {
     lola.receive();
+    if (!lola.maintainConnection(10000, 12000)) return;
 
-    // ----------------------------------------
-    // 5秒に1回、センサーデータを送信するテスト
-    // ----------------------------------------
     static uint32_t last_send_time = 0;
-    if (millis() - last_send_time > 5000) {
+    static uint32_t interval = 5000;
+
+    if (millis() - last_send_time > interval) {
         last_send_time = millis();
+        interval = 5000 + random(0, 1000); 
 
         MySensorData s_data = { 25.5, 60.0 };
-        MySensorData s_data2 = { 30.0, 55.0 };
-        SerialMon.println("\n[送信テスト] SensorData を送信してACKを待機します...");
+        SerialMon.println("\n[センサー送信] SensorData を送信します...");
         
-        if (lola.send_ack(1, s_data, 2000)) {
-            SerialMon.println("  -> 送信成功 (相手からACKを受信しました)");
+        // 構造体の中のIDを自動で読み取って送信し、タイムアウト2000msでACKを待つ
+        if (lola.send_ack(s_data, 2000)) {
+            SerialMon.println("  -> センサー送信完了");
         } else {
-            SerialMon.println("  -> 送信失敗 (タイムアウト: 相手からの応答がありません)");
-        }
-
-        if(lola.send(2, s_data2)) {
-            SerialMon.println("  -> 送信成功 (ACK待ちなし)");
-        } else {
-            SerialMon.println("  -> 送信失敗");
+            SerialMon.println("  -> センサー送信失敗");
         }
     }
 }

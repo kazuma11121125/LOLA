@@ -15,13 +15,20 @@ class LolaStruct {
 private:
     CLoRa* lora;
     uint8_t seq_num;
-    LolaReceiveCallback rx_cb;
+    LolaReceiveCallback rx_cb; // 従来の汎用コールバック（フォールバック用）
+    
+    // 型安全なコールバックを保存する配列 (IDは0〜255)
+    typedef void (*RawCallback)(uint8_t* payload, uint16_t payload_len, int rssi);
+    RawCallback callbacks[256];
     
     // ACK待ち用フラグ
     bool waiting_ack;
     uint8_t ack_expected_seq;
     uint8_t ack_expected_type;
     bool ack_received;
+
+    // 通信生存確認用
+    uint32_t last_rx_time;
 
     // ACKを送信する内部関数
     bool send_ack_reply(uint8_t seq, uint8_t type) {
@@ -39,9 +46,27 @@ public:
         rx_cb = nullptr;
         waiting_ack = false;
         ack_received = false;
+        last_rx_time = 0;
+        for (int i = 0; i < 256; i++) {
+            callbacks[i] = nullptr;
+        }
     }
 
-    // 受信時のコールバック関数を登録
+    // 構造体ごとの専用コールバックを登録する関数
+    template<typename T>
+    void onPacket(void (*cb)(const T& data, int rssi)) {
+        // 型Tごとの静的変数にコールバックを保持
+        static void (*stored_cb)(const T&, int) = nullptr;
+        stored_cb = cb;
+        
+        // ラムダ式をキャストして配列に登録（キャプチャなしラムダは関数ポインタに変換可能）
+        callbacks[T::ID] = [](uint8_t* payload, uint16_t payload_len, int rssi) {
+            if (payload_len == sizeof(T) && stored_cb) {
+                stored_cb(*reinterpret_cast<T*>(payload), rssi);
+            }
+        };
+    }
+
     void setCallback(LolaReceiveCallback cb) {
         rx_cb = cb;
     }
@@ -104,6 +129,19 @@ public:
         return send_ack(T::ID, data, timeout_ms);
     }
 
+    // 通信が生きているか確認する（スマートPing標準搭載）
+    // interval_ms: この時間(ミリ秒)以上通信がなかった場合のみ、実際のPing電波を飛ばします
+    bool isConnected(uint32_t interval_ms = 5000) {
+        // 直近に相手から何らかの通信（データ or ACK or Ping）を受信していれば、通信は生きている
+        if (last_rx_time > 0 && (millis() - last_rx_time < interval_ms)) {
+            return true; 
+        }
+        
+        // 規定時間以上、何も受信していない場合のみPingパケット(ID=255)を飛ばして確認
+        uint8_t dummy = 0; // ペイロードはダミーの1バイト
+        return send_ack(255, dummy, 300); // タイムアウト300msでPing送信
+    }
+
     // パケットを受信する (loop関数内で定期的に呼び出す)
     void receive() {
         if (!lora) return;
@@ -115,18 +153,31 @@ public:
                 
                 if (p_type == 0) { 
                     // ACKパケットを受信した場合
+                    last_rx_time = millis(); // 相手から返事があったので生存時間を更新
+                    
                     if (lora->data.recv_data_len >= 3) {
                         uint8_t ack_p_type = lora->data.recv_data[2];
                         if (waiting_ack && p_seq == ack_expected_seq && ack_p_type == ack_expected_type) {
                             ack_received = true;
                         }
                     }
-                } else {
-                    // 通常のデータパケットを受信した場合 -> 自動でACKを返信
-                    send_ack_reply(p_seq, p_type);
+                } 
+                else if (p_type == 255) {
+                    // 相手からのPingパケットを受信した場合
+                    last_rx_time = millis(); // 生存時間を更新
+                    send_ack_reply(p_seq, p_type); // ACKだけ返す（ユーザーへの通知はしない）
+                } 
+                else {
+                    // 通常のデータパケットを受信した場合
+                    last_rx_time = millis(); // 生存時間を更新
+                    send_ack_reply(p_seq, p_type); // 自動でACKを返信
                     
-                    // コールバック関数を呼び出してユーザーに処理を任せる
-                    if (rx_cb) {
+                    // まず構造体専用のコールバックがあればそれを呼ぶ
+                    if (callbacks[p_type]) {
+                        callbacks[p_type](&lora->data.recv_data[2], lora->data.recv_data_len - 2, lora->data.rssi);
+                    } 
+                    // 専用コールバックがなくて、汎用コールバックがあれば呼ぶ
+                    else if (rx_cb) {
                         rx_cb(p_type, &lora->data.recv_data[2], lora->data.recv_data_len - 2, lora->data.rssi);
                     }
                 }
